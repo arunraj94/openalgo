@@ -1,0 +1,229 @@
+--- API Inspection ---
+
+Method: get_ltp
+    def get_ltp(self, exchange: str = None, symbol: str = None) -> Dict[str, Any]:
+        """
+        Get the latest LTP data in nested format.
+        
+        Args:
+            exchange (str, optional): Filter by exchange
+            symbol (str, optional): Filter by symbol (requires exchange to be specified)
+            
+        Returns:
+            dict: Dictionary with LTP data in nested format:
+                {"ltp": {"EXCHANGE": {"SYMBOL": {"timestamp": timestamp, "ltp": price}}}}
+        """
+        with self.lock:
+            # Create nested format response
+            result = {"ltp": {}}
+            
+            # Process each item in the data structure
+            for symbol_key, data in self.ltp_data.items():
+                # Extract exchange and symbol from the key (format: "EXCHANGE:SYMBOL")
+                if ":" in symbol_key:
+                    parts = symbol_key.split(":")
+                    ex = parts[0]  # Exchange
+                    sym = parts[1]  # Symbol
+                    
+                    # Filter by exchange if specified
+                    if exchange and ex != exchange:
+                        continue
+                        
+                    # Filter by symbol if specified
+                    if symbol and sym != symbol:
+                        continue
+                    
+                    # Initialize exchange dict if not exists
+                    if ex not in result["ltp"]:
+                        result["ltp"][ex] = {}
+                    
+                    # Add data to the nested structure
+                    result["ltp"][ex][sym] = {
+                        "timestamp": data['timestamp'],
+                        "ltp": data['price']
+                    }
+            
+            return result
+
+Method: get_depth
+    def get_depth(self, exchange: str = None, symbol: str = None) -> Dict[str, Any]:
+        """
+        Get the latest Market Depth data in nested format.
+        
+        Args:
+            exchange (str, optional): Filter by exchange
+            symbol (str, optional): Filter by symbol (requires exchange to be specified)
+            
+        Returns:
+            dict: Dictionary with Market Depth data in nested format:
+                {"depth": {"EXCHANGE": {"SYMBOL": {
+                    "timestamp": timestamp,
+                    "ltp": ltp,
+                    "buyBook": {
+                        "1": {"price": price, "qty": quantity, "orders": orders},
+                        # Additional levels...
+                    },
+                    "sellBook": {
+                        "1": {"price": price, "qty": quantity, "orders": orders},
+                        # Additional levels...
+                    }
+                }}}}
+        """
+        with self.lock:
+            # Create nested format response
+            result = {"depth": {}}
+            
+            # Process each item in the data structure
+            for symbol_key, data in self.depth_data.items():
+                # Extract exchange and symbol from the key (format: "EXCHANGE:SYMBOL")
+                if ":" in symbol_key:
+                    parts = symbol_key.split(":")
+                    ex = parts[0]  # Exchange
+                    sym = parts[1]  # Symbol
+                    
+                    # Filter by exchange if specified
+                    if exchange and ex != exchange:
+                        continue
+                        
+                    # Filter by symbol if specified
+                    if symbol and sym != symbol:
+                        continue
+                    
+                    # Initialize exchange dict if not exists
+                    if ex not in result["depth"]:
+                        result["depth"][ex] = {}
+                    
+                    # Initialize the symbol structure
+                    result["depth"][ex][sym] = {
+                        "timestamp": data.get('timestamp', int(time.time() * 1000)),
+                        "ltp": data.get('ltp', 0),
+                        "buyBook": {},
+                        "sellBook": {}
+                    }
+                    
+                    # Process buy depth book
+                    buy_depth = data.get('depth', {}).get('buy', [])
+                    for i, level in enumerate(buy_depth):
+                        level_num = str(i + 1)
+                        result["depth"][ex][sym]["buyBook"][level_num] = {
+                            "price": str(level.get('price', 0)),
+                            "qty": str(level.get('quantity', 0)),
+                            "orders": str(level.get('orders', 0))
+                        }
+                    
+                    # If there are fewer than 5 levels, add empty levels to complete the structure
+                    for i in range(len(buy_depth), 5):
+                        level_num = str(i + 1)
+                        result["depth"][ex][sym]["buyBook"][level_num] = {
+                            "price": "0",
+                            "qty": "0",
+                            "orders": "0"
+                        }
+                    
+                    # Process sell depth book
+                    sell_depth = data.get('depth', {}).get('sell', [])
+                    for i, level in enumerate(sell_depth):
+                        level_num = str(i + 1)
+                        result["depth"][ex][sym]["sellBook"][level_num] = {
+                            "price": str(level.get('price', 0)),
+                            "qty": str(level.get('quantity', 0)),
+                            "orders": str(level.get('orders', 0))
+                        }
+                    
+                    # If there are fewer than 5 levels, add empty levels to complete the structure
+                    for i in range(len(sell_depth), 5):
+                        level_num = str(i + 1)
+                        result["depth"][ex][sym]["sellBook"][level_num] = {
+                            "price": "0",
+                            "qty": "0",
+                            "orders": "0"
+                        }
+            
+            return result
+
+Method placeorder_async NOT FOUND in api class
+
+Method modifyorder_async NOT FOUND in api class
+
+Method cancelorder_async NOT FOUND in api class
+
+Method: orderbook
+    def orderbook(self):
+        """
+        Get orderbook details from the broker with basic orderbook statistics.
+
+        Returns:
+        dict: JSON response containing orders data with format:
+            {
+                "data": {
+                    "orders": [
+                        {
+                            "action": "BUY/SELL",
+                            "exchange": "exchange_code",
+                            "order_status": "status",
+                            "orderid": "id",
+                            "price": price_value,
+                            "pricetype": "type",
+                            "product": "product_type",
+                            "quantity": quantity_value,
+                            "symbol": "symbol_name",
+                            "timestamp": "DD-MMM-YYYY HH:MM:SS",
+                            "trigger_price": trigger_price_value
+                        },
+                        ...
+                    ],
+                    "statistics": {
+                        "total_buy_orders": count,
+                        "total_completed_orders": count,
+                        "total_open_orders": count,
+                        "total_rejected_orders": count,
+                        "total_sell_orders": count
+                    }
+                },
+                "status": "success"
+            }
+        """
+        payload = {
+            "apikey": self.api_key
+        }
+        return self._make_request("orderbook", payload)
+
+Method: expiry
+    def expiry(self, *, symbol, exchange, instrumenttype):
+        """
+        Get expiry dates for a symbol.
+
+        Parameters:
+        - symbol (str): Trading symbol. Required.
+        - exchange (str): Exchange code. Required.
+        - instrumenttype (str): Instrument type (futures/options). Required.
+
+        Returns:
+        dict: JSON response containing expiry dates for the symbol
+        """
+        payload = {
+            "apikey": self.api_key,
+            "symbol": symbol,
+            "exchange": exchange,
+            "instrumenttype": instrumenttype
+        }
+        return self._make_request("expiry", payload)
+
+Method: quotes
+    def quotes(self, *, symbol, exchange):
+        """
+        Get real-time quotes for a symbol.
+
+        Parameters:
+        - symbol (str): Trading symbol. Required.
+        - exchange (str): Exchange code. Required.
+
+        Returns:
+        dict: JSON response containing quote data including bid, ask, ltp, volume etc.
+        """
+        payload = {
+            "apikey": self.api_key,
+            "symbol": symbol,
+            "exchange": exchange
+        }
+        return self._make_request("quotes", payload)

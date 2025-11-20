@@ -1,0 +1,39 @@
+--- API Inspection 3 ---
+
+Method __getattr__ NOT FOUND in api class
+
+Method: _handle_response
+    def _handle_response(self, response):
+        """Helper method to handle API responses"""
+        try:
+            if response.status_code != 200:
+                return {
+                    'status': 'error',
+                    'message': f'HTTP {response.status_code}: {response.text}',
+                    'code': response.status_code,
+                    'error_type': 'http_error'
+                }
+            
+            data = response.json()
+            if data.get('status') == 'error':
+                return {
+                    'status': 'error',
+                    'message': data.get('message', 'Unknown error'),
+                    'code': response.status_code,
+                    'error_type': 'api_error'
+                }
+            return data
+            
+        except ValueError:
+            return {
+                'status': 'error',
+                'message': 'Invalid JSON response from server',
+                'raw_response': response.text,
+                'error_type': 'json_error'
+            }
+        except Exception as e:
+            return {
+                'status': 'error',
+                'message': str(e),
+                'error_type': 'unknown_error'
+            }

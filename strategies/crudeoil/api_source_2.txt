@@ -1,0 +1,142 @@
+--- API Inspection 2 ---
+Dir(api): ['__class__', '__delattr__', '__dict__', '__dir__', '__doc__', '__eq__', '__firstlineno__', '__format__', '__ge__', '__getattribute__', '__getstate__', '__gt__', '__hash__', '__init__', '__init_subclass__', '__le__', '__lt__', '__module__', '__ne__', '__new__', '__reduce__', '__reduce_ex__', '__repr__', '__setattr__', '__sizeof__', '__static_attributes__', '__str__', '__subclasshook__', '__weakref__', '_authenticate', '_handle_response', '_make_request', '_process_message', 'analyzerstatus', 'analyzertoggle', 'basketorder', 'cancelallorder', 'cancelorder', 'closeposition', 'connect', 'depth', 'disconnect', 'expiry', 'funds', 'get_depth', 'get_ltp', 'get_quotes', 'history', 'holdings', 'interval', 'intervals', 'modifyorder', 'openposition', 'orderbook', 'orderstatus', 'placeorder', 'placesmartorder', 'positionbook', 'quotes', 'search', 'splitorder', 'subscribe_depth', 'subscribe_ltp', 'subscribe_quote', 'symbol', 'tradebook', 'unsubscribe_depth', 'unsubscribe_ltp', 'unsubscribe_quote']
+
+
+Method: placeorder
+    def placeorder(self, *, strategy="Python", symbol, action, exchange, price_type="MARKET", product="MIS", quantity=1, **kwargs):
+        """
+        Place an order with the given parameters. All parameters after 'strategy' must be named explicitly.
+
+        Parameters:
+        - strategy (str, optional): The trading strategy name. Defaults to "Python".
+        - symbol (str): Trading symbol. Required.
+        - action (str): BUY or SELL. Required.
+        - exchange (str): Exchange code. Required.
+        - price_type (str, optional): Type of price. Defaults to "MARKET".
+        - product (str, optional): Product type. Defaults to "MIS".
+        - quantity (int/str, optional): Quantity to trade. Defaults to 1.
+        - **kwargs: Optional parameters like:
+            - price (str): Required for LIMIT orders
+            - trigger_price (str): Required for SL and SL-M orders
+            - disclosed_quantity (str): Disclosed quantity
+            - target (str): Target price
+            - stoploss (str): Stoploss price
+            - trailing_sl (str): Trailing stoploss points
+
+        Returns:
+        dict: JSON response from the API.
+        """
+        payload = {
+            "apikey": self.api_key,
+            "strategy": strategy,
+            "symbol": symbol,
+            "action": action,
+            "exchange": exchange,
+            "pricetype": price_type,
+            "product": product,
+            "quantity": str(quantity)
+        }
+        # Convert numeric values to strings
+        for key, value in kwargs.items():
+            if value is not None:
+                payload[key] = str(value)
+        
+        return self._make_request("placeorder", payload)
+
+Method optionsorder NOT FOUND in api class
+
+Method: modifyorder
+    def modifyorder(self, *, order_id, strategy="Python", symbol, action, exchange, price_type="LIMIT", product, quantity, price, disclosed_quantity="0", trigger_price="0", **kwargs):
+        """
+        Modify an existing order.
+
+        Parameters:
+        - order_id (str): The ID of the order to modify. Required.
+        - strategy (str, optional): The trading strategy name. Defaults to "Python".
+        - symbol (str): Trading symbol. Required.
+        - action (str): BUY or SELL. Required.
+        - exchange (str): Exchange code. Required.
+        - price_type (str, optional): Type of price. Defaults to "LIMIT".
+        - product (str): Product type. Required.
+        - quantity (int/str): Quantity to trade. Required.
+        - price (str): New price for the order. Required.
+        - disclosed_quantity (str): Disclosed quantity. Required.
+        - trigger_price (str): Trigger price. Required.
+        - **kwargs: Optional parameters
+
+        Returns:
+        dict: JSON response from the API.
+        """
+        payload = {
+            "apikey": self.api_key,
+            "orderid": order_id,
+            "strategy": strategy,
+            "symbol": symbol,
+            "action": action,
+            "exchange": exchange,
+            "pricetype": price_type,
+            "product": product,
+            "quantity": str(quantity),
+            "price": str(price),
+            "disclosed_quantity": str(disclosed_quantity),
+            "trigger_price": str(trigger_price)
+        }
+        # Convert numeric values to strings
+        for key, value in kwargs.items():
+            if value is not None:
+                payload[key] = str(value)
+        
+        return self._make_request("modifyorder", payload)
+
+Method: cancelorder
+    def cancelorder(self, *, order_id, strategy="Python"):
+        """
+        Cancel an existing order.
+
+        Parameters:
+        - order_id (str): The ID of the order to cancel. Required.
+        - strategy (str, optional): The trading strategy name. Defaults to "Python".
+
+        Returns:
+        dict: JSON response from the API.
+        """
+        payload = {
+            "apikey": self.api_key,
+            "orderid": order_id,
+            "strategy": strategy
+        }
+        return self._make_request("cancelorder", payload)
+
+Method placeorder_async NOT FOUND in api class
+
+Method: _make_request
+    def _make_request(self, endpoint, payload):
+        """Make HTTP request with proper error handling"""
+        url = self.base_url + endpoint
+        try:
+            response = httpx.post(url, json=payload, headers=self.headers, timeout=self.timeout)
+            return self._handle_response(response)
+        except httpx.TimeoutException:
+            return {
+                'status': 'error',
+                'message': 'Request timed out. The server took too long to respond.',
+                'error_type': 'timeout_error'
+            }
+        except httpx.ConnectError:
+            return {
+                'status': 'error',
+                'message': 'Failed to connect to the server. Please check if the server is running.',
+                'error_type': 'connection_error'
+            }
+        except httpx.HTTPError as e:
+            return {
+                'status': 'error',
+                'message': f'HTTP error occurred: {str(e)}',
+                'error_type': 'http_error'
+            }
+        except Exception as e:
+            return {
+                'status': 'error',
+                'message': f'An unexpected error occurred: {str(e)}',
+                'error_type': 'unknown_error'
+            }
