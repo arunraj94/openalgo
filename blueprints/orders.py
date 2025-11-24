@@ -651,3 +651,217 @@ def cancel_all_orders_ui():
             'status': 'error',
             'message': f'An error occurred: {str(e)}'
         }), 500
+
+@orders_bp.route('/action-center')
+@check_session_validity
+@limiter.limit(API_RATE_LIMIT)
+def action_center():
+    """
+    Action Center - Manage pending semi-automated orders
+    Similar to orderbook but for pending approval orders
+    """
+    login_username = session['user']
+
+    # Get filter from query params
+    status_filter = request.args.get('status', 'pending')  # pending, approved, rejected, all
+
+    # Get action center data
+    from services.action_center_service import get_action_center_data
+
+    if status_filter == 'all':
+        success, response, status_code = get_action_center_data(login_username, status_filter=None)
+    else:
+        success, response, status_code = get_action_center_data(login_username, status_filter=status_filter)
+
+    if not success:
+        logger.error(f"Failed to get action center data: {response.get('message', 'Unknown error')}")
+        return render_template('action_center.html',
+                             order_data=[],
+                             order_stats={},
+                             current_filter=status_filter,
+                             login_username=login_username)
+
+    data = response.get('data', {})
+    order_data = data.get('orders', [])
+    order_stats = data.get('statistics', {})
+
+    return render_template('action_center.html',
+                         order_data=order_data,
+                         order_stats=order_stats,
+                         current_filter=status_filter,
+                         login_username=login_username)
+
+@orders_bp.route('/action-center/approve/<int:order_id>', methods=['POST'])
+@check_session_validity
+@limiter.limit(API_RATE_LIMIT)
+def approve_pending_order_route(order_id):
+    """Approve a pending order and execute it"""
+    login_username = session['user']
+
+    from database.action_center_db import approve_pending_order
+    from services.pending_order_execution_service import execute_approved_order
+    from extensions import socketio
+
+    # Approve the order
+    success = approve_pending_order(order_id, approved_by=login_username, user_id=login_username)
+
+    if success:
+        # Execute the order
+        exec_success, response_data, status_code = execute_approved_order(order_id)
+
+        # Emit socket event to notify about order approval
+        socketio.emit('pending_order_updated', {
+            'action': 'approved',
+            'order_id': order_id,
+            'user_id': login_username
+        })
+
+        if exec_success:
+            return jsonify({
+                'status': 'success',
+                'message': 'Order approved and executed successfully',
+                'broker_order_id': response_data.get('orderid')
+            })
+        else:
+            return jsonify({
+                'status': 'warning',
+                'message': 'Order approved but execution failed',
+                'error': response_data.get('message')
+            }), status_code
+    else:
+        return jsonify({'status': 'error', 'message': 'Failed to approve order'}), 400
+
+@orders_bp.route('/action-center/reject/<int:order_id>', methods=['POST'])
+@check_session_validity
+@limiter.limit(API_RATE_LIMIT)
+def reject_pending_order_route(order_id):
+    """Reject a pending order"""
+    login_username = session['user']
+    data = request.json
+    reason = data.get('reason', 'No reason provided')
+
+    from database.action_center_db import reject_pending_order
+    from extensions import socketio
+
+    success = reject_pending_order(order_id, reason=reason, rejected_by=login_username, user_id=login_username)
+
+    if success:
+        # Emit socket event to notify about order rejection
+        socketio.emit('pending_order_updated', {
+            'action': 'rejected',
+            'order_id': order_id,
+            'user_id': login_username
+        })
+
+        return jsonify({
+            'status': 'success',
+            'message': 'Order rejected successfully'
+        })
+    else:
+        return jsonify({'status': 'error', 'message': 'Failed to reject order'}), 400
+
+@orders_bp.route('/action-center/delete/<int:order_id>', methods=['DELETE'])
+@check_session_validity
+@limiter.limit(API_RATE_LIMIT)
+def delete_pending_order_route(order_id):
+    """Delete a pending order (only if not pending)"""
+    login_username = session['user']
+
+    from database.action_center_db import delete_pending_order
+    from extensions import socketio
+
+    success = delete_pending_order(order_id, user_id=login_username)
+
+    if success:
+        # Emit socket event to notify about order deletion
+        socketio.emit('pending_order_updated', {
+            'action': 'deleted',
+            'order_id': order_id,
+            'user_id': login_username
+        })
+
+        return jsonify({'status': 'success', 'message': 'Order deleted successfully'})
+    else:
+        return jsonify({'status': 'error', 'message': 'Failed to delete order'}), 400
+
+@orders_bp.route('/action-center/count')
+@check_session_validity
+def action_center_count():
+    """Get count of pending orders for badge"""
+    login_username = session['user']
+
+    from database.action_center_db import get_pending_count
+
+    count = get_pending_count(login_username)
+
+    return jsonify({'count': count})
+
+@orders_bp.route('/action-center/approve-all', methods=['POST'])
+@check_session_validity
+@limiter.limit(API_RATE_LIMIT)
+def approve_all_pending_orders():
+    """Approve and execute all pending orders"""
+    login_username = session['user']
+
+    from database.action_center_db import get_pending_orders, approve_pending_order
+    from services.pending_order_execution_service import execute_approved_order
+    from extensions import socketio
+
+    # Get all pending orders for this user
+    pending_orders = get_pending_orders(login_username, status='pending')
+
+    if not pending_orders:
+        return jsonify({
+            'status': 'info',
+            'message': 'No pending orders to approve'
+        }), 200
+
+    # Track results
+    approved_count = 0
+    executed_count = 0
+    failed_executions = []
+
+    # Approve and execute each order
+    for order in pending_orders:
+        # Approve the order
+        success = approve_pending_order(order.id, approved_by=login_username)
+
+        if success:
+            approved_count += 1
+
+            # Execute the order
+            exec_success, response_data, status_code = execute_approved_order(order.id)
+
+            if exec_success:
+                executed_count += 1
+            else:
+                failed_executions.append({
+                    'order_id': order.id,
+                    'error': response_data.get('message', 'Unknown error')
+                })
+
+    # Emit socket event to notify about batch approval
+    socketio.emit('pending_order_updated', {
+        'action': 'batch_approved',
+        'user_id': login_username,
+        'count': approved_count
+    })
+
+    # Prepare response message
+    if approved_count == executed_count:
+        message = f'Successfully approved and executed all {approved_count} orders'
+        status = 'success'
+    elif executed_count > 0:
+        message = f'Approved {approved_count} orders. {executed_count} executed successfully, {len(failed_executions)} failed'
+        status = 'warning'
+    else:
+        message = f'Approved {approved_count} orders but all executions failed'
+        status = 'error'
+
+    return jsonify({
+        'status': status,
+        'message': message,
+        'approved_count': approved_count,
+        'executed_count': executed_count,
+        'failed_executions': failed_executions
+    }), 200
