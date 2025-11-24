@@ -34,6 +34,14 @@ class QuotesSchema(Schema):
     symbol = fields.Str(required=True)  # Single symbol
     exchange = fields.Str(required=True)  # Exchange (e.g., NSE, BSE)
 
+class SymbolExchangePair(Schema):
+    symbol = fields.Str(required=True)
+    exchange = fields.Str(required=True)
+
+class MultiQuotesSchema(Schema):
+    apikey = fields.Str(required=True)
+    symbols = fields.List(fields.Nested(SymbolExchangePair), required=True, validate=validate.Length(min=1))
+
 class HistorySchema(Schema):
     apikey = fields.Str(required=True)
     symbol = fields.Str(required=True)
@@ -87,11 +95,11 @@ class ExpirySchema(Schema):
 
 class OptionSymbolSchema(Schema):
     apikey = fields.Str(required=True)      # API Key for authentication
-    strategy = fields.Str(required=True)    # Strategy name
+    strategy = fields.Str(required=False, allow_none=True)    # DEPRECATED: Strategy name (optional, will be removed in future versions)
     underlying = fields.Str(required=True)  # Underlying symbol (NIFTY, RELIANCE, NIFTY28OCT25FUT)
     exchange = fields.Str(required=True)    # Exchange (NSE_INDEX, NSE, NFO)
     expiry_date = fields.Str(required=False)  # Expiry date in DDMMMYY format (e.g., 28OCT25). Optional if underlying includes expiry
-    strike_int = fields.Int(required=True, validate=validate.Range(min=1))  # Strike interval/difference (e.g., 50 for NIFTY, 100 for BANKNIFTY)
+    strike_int = fields.Int(required=False, validate=validate.Range(min=1), allow_none=True)  # OPTIONAL: Strike interval. If not provided, actual strikes from database will be used (RECOMMENDED for accuracy)
     offset = fields.Str(required=True, validate=validate_option_offset)      # Strike offset from ATM (ATM, ITM1-ITM50, OTM1-OTM50)
     option_type = fields.Str(required=True, validate=validate.OneOf(["CE", "PE", "ce", "pe"]))  # Call or Put option
 
@@ -103,3 +111,10 @@ class OptionGreeksSchema(Schema):
     underlying_symbol = fields.Str(required=False)   # Optional: Specify underlying symbol (e.g., NIFTY or NIFTY28NOV24FUT)
     underlying_exchange = fields.Str(required=False)  # Optional: Specify underlying exchange (NSE_INDEX, NFO, etc.)
     expiry_time = fields.Str(required=False)  # Optional: Custom expiry time in HH:MM format (e.g., "15:30", "19:00"). If not provided, uses exchange defaults
+
+class InstrumentsSchema(Schema):
+    apikey = fields.Str(required=True)      # API Key for authentication
+    exchange = fields.Str(required=False, validate=validate.OneOf([
+        "NSE", "BSE", "NFO", "BFO", "BCD", "CDS", "MCX", "NSE_INDEX", "BSE_INDEX"
+    ]))  # Optional exchange filter
+    format = fields.Str(required=False, validate=validate.OneOf(["json", "csv"]))  # Output format (json or csv), defaults to json
