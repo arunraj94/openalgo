@@ -212,7 +212,7 @@ class MeanRevRun:
             if not long_order or long_order.get('order_status') != 'complete':
                 logger.error(f"Long Leg Failed/Rejected: {long_order}")
                 # Cleanup: If short leg was somehow placed (unlikely due to await), cancel it
-                if short_order and short_order.get('order_status') == 'open':
+                if short_order and short_order.get('order_status') == 'open' or short_order.get('order_status') == 'trigger pending':
                      await self.client.async_cancel_order(short_order['orderid'])
                 return
 
@@ -359,7 +359,7 @@ class MeanRevRun:
         # ========================================
         # Check SL Hit on Short Leg via Order Status
         info = self.client.get_order_info_of_order(self.short_leg['sl_order']['orderid'])
-        if info and info.get('order_status','').lower() != 'open':
+        if info and info.get('order_status','').lower() != 'trigger pending':
             logger.info("MeanRev Short Leg SL Hit!")
             self.exit_trade("SL Hit")
             return
