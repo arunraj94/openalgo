@@ -76,6 +76,8 @@ class VolExpRun:
         self.current_trade_id = None
         self.entry_time = None
         self.total_premium_paid = 0.0
+        self.highest_profit_pct = 0.0  # Track peak profit for trailing
+        self.trailing_active = False   # Trailing stop activated?
         
         self.lock = threading.Lock()
 
@@ -130,7 +132,9 @@ class VolExpRun:
     # Trade Management
     # --------------------------------------------------------
     def manage_trade(self):
-        if not self.active_position: return
+        """Enhanced trade management with trailing profit protection"""
+        if not self.active_position: 
+            return
 
         # Calculate PnL
         current_pnl = 0.0
@@ -150,17 +154,52 @@ class VolExpRun:
             profit_pct = (current_pnl / invested) * 100.0
         else:
             profit_pct = 0.0
-
+        
+        # ========================================
+        # 1. TRAILING PROFIT PROTECTION (New!)
+        # ========================================
+        TRAILING_ACTIVATION = 10.0  # Activate trailing at +10%
+        TRAILING_OFFSET = 10.0      # Trail by 10% from peak
+        
+        if profit_pct >= TRAILING_ACTIVATION:
+            # Update highest profit
+            if profit_pct > self.highest_profit_pct:
+                self.highest_profit_pct = profit_pct
+                logger.info(f"📈 New Peak Profit: {profit_pct:.1f}%")
+                
+                if not self.trailing_active:
+                    self.trailing_active = True
+                    logger.info(f"✅ Trailing Stop ACTIVATED (Peak: {profit_pct:.1f}%)")
+            
+            # Calculate trailing threshold
+            trailing_threshold = self.highest_profit_pct - TRAILING_OFFSET
+            
+            # Check if profit dropped below trailing threshold
+            if profit_pct <= trailing_threshold:
+                logger.warning(f"📉 Trailing Stop Hit!")
+                logger.info(f"   Peak Profit: {self.highest_profit_pct:.1f}%")
+                logger.info(f"   Current Profit: {profit_pct:.1f}%")
+                logger.info(f"   Drop from Peak: {self.highest_profit_pct - profit_pct:.1f}%")
+                self.exit_trade(f"Trailing Stop: Lock Profit at {profit_pct:.1f}% (Peak: {self.highest_profit_pct:.1f}%)")
+                return
+        
+        # ========================================
+        # 2. PROFIT TARGET
+        # ========================================
         if profit_pct >= self.cfg.VOLEXP_TARGET_PREMIUM_PCT:
-            self.exit_trade("Target Hit (50%)")
+            self.exit_trade(f"Target Hit ({self.cfg.VOLEXP_TARGET_PREMIUM_PCT:.0f}%)")
             return
-            
-        # Stop Loss (Managed by broker orders, but check here too)
+        
+        # ========================================
+        # 3. STOP LOSS
+        # ========================================
         if profit_pct <= self.cfg.VOLEXP_STOP_PREMIUM_PCT:
-            self.exit_trade("Stop Loss Hit (-40%)")
+            self.exit_trade(f"Stop Loss Hit ({self.cfg.VOLEXP_STOP_PREMIUM_PCT:.0f}%)")
             return
-            
-        # Time Exit (30 mins no move)
+        
+        # ========================================
+        # 4. TIME EXIT
+        # ========================================
         elapsed_mins = (self.now_ist() - self.entry_time).total_seconds() / 60.0
         if elapsed_mins > self.cfg.VOLEXP_TIME_EXIT_MINUTES and profit_pct < 5.0:
             self.exit_trade("Time Exit (No Move)")
@@ -192,9 +231,11 @@ class VolExpRun:
         async def place():
             qty = lots * self.cfg.LOTSIZE
             
-            # Place Orders
-            ce_order = await self.client.async_place_orders(ce_symbol, 'BUY', qty, strategy_tag="VOLEXP")
-            pe_order = await self.client.async_place_orders(pe_symbol, 'BUY', qty, strategy_tag="VOLEXP")
+            # Place Both Orders in Parallel (minimize slippage)
+            ce_order, pe_order = await asyncio.gather(
+                self.client.async_place_orders(ce_symbol, 'BUY', qty, strategy_tag="VOLEXP"),
+                self.client.async_place_orders(pe_symbol, 'BUY', qty, strategy_tag="VOLEXP")
+            )
             
             self.ce = {
                 'symbol': ce_symbol, 'buy_price': ce_order['price'], 'qty': qty, 
@@ -207,6 +248,8 @@ class VolExpRun:
             
             self.active_position = True
             self.entry_time = self.now_ist()
+            self.highest_profit_pct = 0.0  # Reset profit tracking
+            self.trailing_active = False   # Reset trailing flag
             
             try:
                 self.current_trade_id = log_entry(
@@ -241,6 +284,8 @@ class VolExpRun:
             self.ce = None
             self.pe = None
             self.current_trade_id = None
+            self.highest_profit_pct = 0.0
+            self.trailing_active = False
             
         self._run_async(close())
 
@@ -253,27 +298,26 @@ class VolExpRun:
         if ltp is None: return
 
         dt = datetime.fromtimestamp(ts_ms/1000.0, pytz.utc).astimezone(IST)
+        
+        # CHANGED: Use 5-minute candles for volatility expansion
+        # ATR compression/expansion is more meaningful on 5-min vs 1-min noise
         minute = dt.replace(second=0, microsecond=0)
+        candle_5min = minute.replace(minute=(minute.minute // 5) * 5)
 
         with self.lock:
             if self.curr_min is None:
-                self.curr_min = minute
+                self.curr_min = candle_5min
                 self.open = self.high = self.low = self.close = ltp
                 return
 
-            if minute != self.curr_min:
-                # Finalize candle
+            if candle_5min != self.curr_min:
+                # Finalize 5-minute candle
                 row = {'timestamp': self.curr_min, 'open': self.open, 'high': self.high, 'low': self.low, 'close': self.close}
                 self.ohlc.append(row)
                 self.update_ohlc_df()
                 self.compute_atrs()
                 
-                # Update detector
-                self.detector.update_ohlc(self.ohlc_df)
-                self.detector.latest_atr_short = self.atr_short
-                self.detector.latest_atr_long = self.atr_long
-                
-                # Update detector
+                # Update detector with 5-min data
                 self.detector.update_ohlc(self.ohlc_df)
                 self.detector.latest_atr_short = self.atr_short
                 self.detector.latest_atr_long = self.atr_long
@@ -283,11 +327,21 @@ class VolExpRun:
                 if self.active_position:
                     self.manage_trade()
                 else:
-                    # Check for Entry
+                    # Check for Entry - 5-min volatility expansion signals
                     signal = self.detector.evaluate_expansion_signals()
                     if signal:
+                        logger.info(f"[5-MIN] VolExp Signal: {signal}")
                         lots = compute_lots_from_config(self.cfg)
                         self.place_trade(signal, lots)
+                
+                # Reset for next 5-min candle
+                self.curr_min = candle_5min
+                self.open = self.high = self.low = self.close = ltp
+            else:
+                # Update current 5-min candle
+                self.close = ltp
+                self.high = max(self.high, ltp)
+                self.low = min(self.low, ltp)
 
     def on_option_tick(self, symbol, ltp):
         if self.ce and symbol == self.ce['symbol']:
@@ -319,6 +373,8 @@ class VolExpRun:
         self.client.connect()
         subs_sym = self.client.get_option_symbols(self.cfg.UNDERLYING_SYMBOL, self.cfg.UNDERLYING_EXCHANGE)
         self.client.subscribe_ltp(subs_sym)
+        self.client.subscribe_depth(subs_sym)
+        self.client.subscribe_orderbook()
         logger.info("VolExp Runner Listening...")
         try:
             while True: time.sleep(1)

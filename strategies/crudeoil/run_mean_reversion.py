@@ -75,6 +75,7 @@ class MeanRevRun:
         self.long_leg = None
         self.current_trade_id = None
         self.entry_time = None
+        self.position_signal = None  # Track entry signal ("BUY" or "SELL")
         self.spread_credit = 0.0
         
         self.lock = threading.Lock()
@@ -201,11 +202,11 @@ class MeanRevRun:
         async def place():
             quantity = lots * self.cfg.LOTSIZE
             
-            # 1. Buy Hedge (Long Leg) First
-            long_order = await self.client.async_place_orders(long_symbol, 'BUY', quantity, strategy_tag="MEANREV")
-            
-            # 2. Sell Premium (Short Leg)
-            short_order = await self.client.async_place_orders(short_symbol, 'SELL', quantity, strategy_tag="MEANREV")
+            # Place Both Legs in Parallel (minimize slippage)
+            long_order, short_order = await asyncio.gather(
+                self.client.async_place_orders(long_symbol, 'BUY', quantity, strategy_tag="MEANREV"),
+                self.client.async_place_orders(short_symbol, 'SELL', quantity, strategy_tag="MEANREV")
+            )
             
             # Check Order Status
             if not long_order or long_order.get('order_status') != 'complete':
@@ -253,6 +254,7 @@ class MeanRevRun:
             
             self.active_position = True
             self.entry_time = self.now_ist()
+            self.position_signal = signal  # Track entry signal
             self.spread_credit = (short_price - long_price) * quantity
             
             try:
@@ -313,9 +315,48 @@ class MeanRevRun:
     # Trade Management
     # --------------------------------------------------------
     def manage_trade(self):
+        """Enhanced trade management with signal reversal detection"""
         if not self.active_position or not self.short_leg:
             return
+        
+        # ========================================
+        # 1. CHECK FOR SIGNAL REVERSAL (New!)
+        # ========================================
+        # If we entered on OVERSOLD, check if now OVERBOUGHT (and vice versa)
+        current_signal = self.detector.evaluate_signal()
+        
+        if current_signal and current_signal != self.position_signal:
+            # Opposite signal detected!
+            short_pnl = (self.short_leg['sell_price'] - self.short_leg['current_price']) * self.short_leg['qty']
+            long_pnl = (self.long_leg['current_price'] - self.long_leg['buy_price']) * self.long_leg['qty']
+            total_pnl = short_pnl + long_pnl
             
+            logger.warning(f"⚠️ SIGNAL REVERSAL DETECTED!")
+            logger.info(f"   Entry Signal: {self.position_signal}")
+            logger.info(f"   Current Signal: {current_signal}")
+            logger.info(f"   Current P&L: ₹{total_pnl:.0f}")
+            
+            # Exit if in loss (don't wait for full SL)
+            if total_pnl < 0:
+                logger.warning(f"   ❌ In Loss - Exiting Early (Before SL)")
+                logger.info(f"   💡 Mean reversion failed, opposite extreme detected")
+                self.exit_trade(f"Signal Reversal: {self.position_signal}→{current_signal}, Loss=₹{total_pnl:.0f}")
+                return
+            
+            # Exit if small profit (<20% of target)
+            elif total_pnl < (self.spread_credit * 0.20):
+                logger.warning(f"   ⚠️ Small Profit but Signal Reversed")
+                logger.info(f"   💡 Locking profit early")
+                self.exit_trade(f"Signal Reversal (Small Profit): ₹{total_pnl:.0f}")
+                return
+            
+            # Keep if good profit (>=20%)
+            else:
+                logger.info(f"   ✅ Good Profit (₹{total_pnl:.0f}) - Keeping Position")
+        
+        # ========================================
+        # 2. STOP LOSS CHECK
+        # ========================================
         # Check SL Hit on Short Leg via Order Status
         info = self.client.get_order_info_of_order(self.short_leg['sl_order']['orderid'])
         if info and info.get('order_status','').lower() != 'open':
@@ -353,32 +394,34 @@ class MeanRevRun:
         if ltp is None: return
 
         dt = datetime.fromtimestamp(ts_ms/1000.0, pytz.utc).astimezone(IST)
+        
+        # CHANGED: Use 5-minute candles for better mean reversion signals
+        # VWAP deviation on 5-min is more meaningful than 1-min noise
         minute = dt.replace(second=0, microsecond=0)
+        candle_5min = minute.replace(minute=(minute.minute // 5) * 5)
 
         with self.lock:
             if self.curr_min is None:
-                self.curr_min = minute
+                self.curr_min = candle_5min
                 self.open = self.high = self.low = self.close = ltp
                 return
 
-            if minute != self.curr_min:
-                # Finalize candle
+            if candle_5min != self.curr_min:
+                # Finalize 5-minute candle
                 row = {'timestamp': self.curr_min, 'open': self.open, 'high': self.high, 'low': self.low, 'close': self.close}
                 self.ohlc.append(row)
                 self.update_ohlc_df()
                 self.compute_atrs()
                 
-                # Update MeanRev logic
+                # Update MeanRev logic with 5-min data
                 self.detector.update_ohlc(self.ohlc_df)
                 
-                # ENTRY LOGIC
+                # ENTRY LOGIC - Now using 5-min VWAP deviation
                 if not self.active_position:
                     signal = self.detector.evaluate_signal()
                     if signal:
-                        logger.info(f"MeanRev Signal: {signal}")
-                        # Pass signal direction for correlation sizing
-                        # Mean Reversion: BUY signal means we expect UP move (Bullish)
-                        # SELL signal means we expect DOWN move (Bearish)
+                        logger.info(f"[5-MIN] MeanRev Signal: {signal}")
+                        # Mean Reversion: BUY = expect UP move, SELL = expect DOWN move
                         direction = "BULLISH" if signal == "BUY" else "BEARISH"
                         lots = compute_lots_from_config(self.atr_short, self.cfg, legs_count=1, signal_direction=direction)
                         if lots > 0:
@@ -387,9 +430,10 @@ class MeanRevRun:
                 # EXIT LOGIC
                 self.check_intraday_squareoff()
 
-                self.curr_min = minute
+                self.curr_min = candle_5min
                 self.open = self.high = self.low = self.close = ltp
             else:
+                # Update current 5-min candle
                 self.close = ltp
                 self.high = max(self.high, ltp)
                 self.low = min(self.low, ltp)
@@ -427,6 +471,8 @@ class MeanRevRun:
         self.client.connect()
         subs_sym = self.client.get_option_symbols(self.cfg.UNDERLYING_SYMBOL, self.cfg.UNDERLYING_EXCHANGE)
         self.client.subscribe_ltp(subs_sym)
+        self.client.subscribe_depth(subs_sym)
+        self.client.subscribe_orderbook()
         logger.info("MeanRev Runner Listening...")
         try:
             while True: time.sleep(1)

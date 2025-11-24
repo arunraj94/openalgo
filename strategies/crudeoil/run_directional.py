@@ -17,6 +17,7 @@ from openalgo_client import OpenAlgoClientWrapper
 from position_sizing import compute_lots_from_config
 from logger import setup_logger
 from ml_engine import MLEngine
+from strategy_coordinator import get_coordinator
 
 # Setup Logger
 logger = setup_logger("DIRECTIONAL")
@@ -53,6 +54,9 @@ class DirectionalRun:
         self.ml_engine = MLEngine(model_path=self.cfg.ML_MODEL_PATH) if getattr(self.cfg, 'ENABLE_ML_FILTER', False) else None
         self.db_session = init_db(self.cfg.DB_PATH)
         
+        # Strategy Coordinator (prevent conflict with ratio spread)
+        self.coordinator = get_coordinator()
+        
         self.client = OpenAlgoClientWrapper(
             api_key=self.cfg.OPENALGO_API_KEY,
             host=self.cfg.OPENALGO_HOST,
@@ -76,6 +80,7 @@ class DirectionalRun:
         self.long_leg = None
         self.current_trade_id = None
         self.entry_time = None
+        self.position_direction = None  # "BULLISH" or "BEARISH" - track position direction
         self.highest_profit = 0.0
         self.trailing_active = False
         
@@ -100,6 +105,29 @@ class DirectionalRun:
             self.ohlc_df = pd.DataFrame(columns=['timestamp','open','high','low','close'])
         else:
             self.ohlc_df = pd.DataFrame(self.ohlc)
+    
+    def minutes_since_entry(self):
+        """Calculate minutes since position entry"""
+        if not self.entry_time:
+            return 0
+        return (self.now_ist() - self.entry_time).total_seconds() / 60.0
+    
+    def calculate_pnl_pct(self):
+        """Calculate current P&L as percentage of entry capital"""
+        if not self.short_leg or not self.long_leg:
+            return 0.0
+        
+        # Calculate spread P&L
+        short_pnl = (self.short_leg['sell_price'] - self.short_leg['current_price']) * self.short_leg['qty']
+        long_pnl = (self.long_leg['current_price'] - self.long_leg['buy_price']) * self.long_leg['qty']
+        total_pnl = short_pnl + long_pnl
+        
+        # Entry capital (max risk on spread)
+        entry_capital = abs(self.short_leg['sell_price'] - self.long_leg['buy_price']) * self.short_leg['qty']
+        
+        if entry_capital > 0:
+            return (total_pnl / entry_capital) * 100.0
+        return 0.0
 
     def compute_atrs(self):
         if self.ohlc_df is None or len(self.ohlc_df) < max(self.cfg.ATR_LONG_PERIOD, self.cfg.ATR_SHORT_PERIOD) + 1:
@@ -160,6 +188,12 @@ class DirectionalRun:
     # Trade Execution (Credit Spread)
     # --------------------------------------------------------
     def enter_trade(self, direction, lots):
+        # CHECK STRATEGY COORDINATOR: Prevent conflict with Ratio Spread
+        can_enter, reason = self.coordinator.can_enter_same_direction('directional', direction)
+        if not can_enter:
+            logger.warning(f"⛔ Skipping Directional Entry: {reason}")
+            return
+        
         ltp = self.client.get_exchange_ltp()
         atm = self.client.get_ATM_strike(ltp)
         
@@ -207,11 +241,11 @@ class DirectionalRun:
         async def place():
             quantity = lots * self.cfg.LOTSIZE
             
-            # 1. Buy Hedge (Long Leg) First for Margin Benefit
-            long_order = await self.client.async_place_orders(long_symbol, 'BUY', quantity, strategy_tag="DIRECTIONAL")
-            
-            # 2. Sell Premium (Short Leg)
-            short_order = await self.client.async_place_orders(short_symbol, 'SELL', quantity, strategy_tag="DIRECTIONAL")
+            # Place both legs in parallel to minimize slippage
+            long_order, short_order = await asyncio.gather(
+                self.client.async_place_orders(long_symbol, 'BUY', quantity, strategy_tag="DIRECTIONAL"),
+                self.client.async_place_orders(short_symbol, 'SELL', quantity, strategy_tag="DIRECTIONAL")
+            )
             
             # Check Order Status
             if not long_order or long_order.get('order_status') != 'complete':
@@ -265,6 +299,7 @@ class DirectionalRun:
             
             self.active_position = True
             self.entry_time = self.now_ist()
+            self.position_direction = direction  # Track position direction
             self.highest_profit = 0.0
             self.trailing_active = False
             
@@ -276,6 +311,10 @@ class DirectionalRun:
                 )
             except Exception as e:
                 logger.error(f"DB Log Error: {e}")
+            
+            # MARK STRATEGY AS ACTIVE in coordinator
+            self.coordinator.mark_entry('directional', direction=direction)
+            logger.info(f"✅ Directional strategy marked as active ({direction})")
 
         self._run_async(place())
 
@@ -306,19 +345,27 @@ class DirectionalRun:
             
             # Log exit
             try:
-                # Calculate Net PnL
-                short_pnl = (self.short_leg['sell_price'] - self.short_leg['current_price']) * self.short_leg['qty']
-                long_pnl = (self.long_leg['current_price'] - self.long_leg['buy_price']) * self.long_leg['qty']
-                total_realized = short_pnl + long_pnl
+                # Calculate PnL
+                realized = 0.0
+                if self.short_leg:
+                    realized += (self.short_leg['sell_price'] - self.short_leg['current_price']) * self.short_leg['qty']
+                if self.long_leg:
+                    realized += (self.long_leg['current_price'] - self.long_leg['buy_price']) * self.long_leg['qty']
                 
                 log_exit(self.db_session, self.current_trade_id, 
-                         ce_buy=None, pe_buy=None, realized_pnl=total_realized, notes=reason)
-            except: pass
-                
+                         ce_buy=None, pe_buy=None, realized_pnl=realized, notes=reason)
+            except Exception as e:
+                logger.error(f"Exit Log Error: {e}")
+            
+            # MARK STRATEGY AS INACTIVE in coordinator
+            self.coordinator.mark_exit('directional')
+            logger.info("✅ Directional strategy marked as inactive")
+            
             self.active_position = False
             self.short_leg = None
             self.long_leg = None
             self.current_trade_id = None
+            self.position_direction = None  # Reset direction
 
         self._run_async(close())
 
@@ -326,17 +373,60 @@ class DirectionalRun:
     # Trade Management
     # --------------------------------------------------------
     def manage_trade(self):
+        """Enhanced trade management with trend reversal detection"""
         if not self.active_position or not self.short_leg:
             return
-
+        
+        # ========================================
+        # 1. TREND REVERSAL EXIT (New Feature!)
+        # ========================================
+        current_trend = self.detectors.evaluate_trend_direction()
+        
+        if current_trend and current_trend != self.position_direction:
+            # Opposite trend detected!
+            pnl_pct = self.calculate_pnl_pct()
+            minutes_in_trade = self.minutes_since_entry()
+            
+            logger.warning(f"⚠️ TREND REVERSAL DETECTED!")
+            logger.info(f"   Position Direction: {self.position_direction}")
+            logger.info(f"   New Trend: {current_trend}")
+            logger.info(f"   Current P&L: {pnl_pct:.1f}%")
+            logger.info(f"   Time in Trade: {minutes_in_trade:.0f} minutes")
+            
+            # Decision Logic:
+            # Exit if in loss (cut losses early, don't wait for SL)
+            if pnl_pct < 0:
+                logger.warning(f"   ❌ In Loss ({pnl_pct:.1f}%) - Exiting Early")
+                logger.info(f"   💡 Better to cut loss now and enter new {current_trend} trend")
+                self.exit_trade(f"Trend Reversal: {self.position_direction}→{current_trend}, P&L={pnl_pct:.1f}%")
+                return
+            
+            # Exit if small profit (< 10%) and trend reversed
+            elif pnl_pct < 10.0:
+                logger.warning(f"   ⚠️ Small Profit ({pnl_pct:.1f}%) but Trend Reversed")
+                logger.info(f"   💡 Locking profit and freeing up for new {current_trend} trade")
+                self.exit_trade(f"Trend Reversal (Small Profit): {pnl_pct:.1f}%")
+                return
+            
+            # Keep position if in good profit (>= 10%)
+            else:
+                logger.info(f"   ✅ Good Profit ({pnl_pct:.1f}%) - Keeping Position")
+                logger.info(f"   💡 Will manage with trailing SL instead")
+        
+        # ========================================
+        # 2. STOP LOSS CHECK
+        # ========================================
         # Check SL hit on Short Leg
         if self.short_leg.get('sl_order'):
             info = self.client.get_order_info_of_order(self.short_leg['sl_order']['orderid'])
-            if info and info.get('order_status','').lower() != 'open':
+            if info and info.get('order_status','').lower() != 'trigger pending':
                 logger.info("Short Leg SL Hit! Exiting Spread.")
                 self.exit_trade("SL Hit")
                 return
         
+        # ========================================
+        # 3. TRAILING LOGIC
+        # ========================================
         # Trailing Logic (Based on Short Leg Decay)
         curr_price = self.short_leg['current_price']
         sell_price = self.short_leg['sell_price']
@@ -369,22 +459,25 @@ class DirectionalRun:
         if ltp is None: return
 
         dt = datetime.fromtimestamp(ts_ms/1000.0, pytz.utc).astimezone(IST)
+        
+        # CHANGED: Use 5-minute candles instead of 1-minute
         minute = dt.replace(second=0, microsecond=0)
+        candle_5min = minute.replace(minute=(minute.minute // 5) * 5)
 
         with self.lock:
             if self.curr_min is None:
-                self.curr_min = minute
+                self.curr_min = candle_5min
                 self.open = self.high = self.low = self.close = ltp
                 return
 
-            if minute != self.curr_min:
-                # Finalize candle
+            if candle_5min != self.curr_min:
+                # Finalize 5-minute candle
                 row = {'timestamp': self.curr_min, 'open': self.open, 'high': self.high, 'low': self.low, 'close': self.close}
                 self.ohlc.append(row)
                 self.update_ohlc_df()
                 self.compute_atrs()
                 
-                # Update detectors
+                # Update detectors with 5-min data
                 self.detectors.update_ohlc(self.ohlc_df)
                 self.detectors.latest_atr_short = self.atr_short
                 self.detectors.latest_atr_long = self.atr_long
@@ -394,30 +487,22 @@ class DirectionalRun:
                 if self.active_position:
                     self.manage_trade()
                 else:
-                    # ENTRY LOGIC
+                    # ENTRY LOGIC - Now using 5-min candles
                     if self.in_allowed_window():
-                        # Simple SMA Crossover for Direction
-                        if self.ohlc_df is not None and len(self.ohlc_df) > 20:
-                            sma5 = self.ohlc_df['close'].rolling(5).mean().iloc[-1]
-                            sma20 = self.ohlc_df['close'].rolling(20).mean().iloc[-1]
-                            prev_sma5 = self.ohlc_df['close'].rolling(5).mean().iloc[-2]
-                            prev_sma20 = self.ohlc_df['close'].rolling(20).mean().iloc[-2]
-                            
-                            sig = None
-                            if prev_sma5 < prev_sma20 and sma5 > sma20:
-                                sig = "BULLISH"
-                            elif prev_sma5 > prev_sma20 and sma5 < sma20:
-                                sig = "BEARISH"
-                            print(sig)    
-                            if sig:
-                                lots = compute_lots_from_config(self.atr_short, self.cfg, legs_count=1, signal_direction=sig)
-                                print(lots)
-                                if lots > 0:
-                                    self.enter_trade(sig, lots)
+                        # Directional signal from entries_directional.py
+                        # Uses EMA, ADX, Supertrend on 5-min data (better signals!)
+                        direction = self.detectors.evaluate_trend_direction()
+                        
+                        if direction:  # "BULLISH" or "BEARISH"
+                            logger.info(f"✅ 5-MIN Signal: {direction} trend confirmed")
+                            lots = compute_lots_from_config(self.atr_short, self.cfg, legs_count=1, signal_direction=direction)
+                            if lots > 0:
+                                self.enter_trade(direction, lots)
 
-                self.curr_min = minute
+                self.curr_min = candle_5min
                 self.open = self.high = self.low = self.close = ltp
             else:
+                # Update current 5-min candle
                 self.close = ltp
                 self.high = max(self.high, ltp)
                 self.low = min(self.low, ltp)
@@ -454,7 +539,13 @@ class DirectionalRun:
     def start(self):
         self.client.connect()
         subs_sym = self.client.get_option_symbols(self.cfg.UNDERLYING_SYMBOL, self.cfg.UNDERLYING_EXCHANGE)
-        self.client.subscribe_ltp(subs_sym)
+        if subs_sym:  # Check for None
+            self.client.subscribe_ltp(subs_sym)
+            self.client.subscribe_depth(subs_sym)
+            self.client.subscribe_orderbook()
+        else:
+            logger.error("Failed to get option symbols. Cannot subscribe.")
+            return
         logger.info("Directional Runner (Credit Spread) Listening...")
         try:
             while True: time.sleep(1)

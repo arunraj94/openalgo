@@ -22,7 +22,9 @@ class ExitEngine:
                  no_move_wait_minutes=15,
                  min_decay_pct=3.0,
                  move_threshold_mult=0.5,
-                 client=None):
+                 client=None,
+                 use_dynamic_trailing=True,
+                 dynamic_trail_levels=None):
 
         self.target_pct_of_credit = target_pct_of_credit
         self.trail_factor = trail_factor
@@ -31,6 +33,13 @@ class ExitEngine:
         self.min_decay_pct = min_decay_pct
         self.move_threshold_mult = move_threshold_mult
         self.client = client
+        self.use_dynamic_trailing = use_dynamic_trailing
+        self.dynamic_trail_levels = dynamic_trail_levels or [
+            (0,   3.0, 2.0),   # 0-10% profit: Wide buffer
+            (10,  2.5, 1.5),   # 10-25% profit: Medium buffer
+            (25,  2.0, 1.2),   # 25-40% profit: Tighter buffer
+            (40,  1.5, 0.75),  # >40% profit: Tightest buffer
+        ]
 
     def should_exit_no_move(self, bot):
         """
@@ -68,8 +77,6 @@ class ExitEngine:
             if not ohlc_df.empty:
                 recent = ohlc_df[ohlc_df['timestamp'] >= bot.current_trade_entry_time]
                 if not recent.empty:
-                # recent = bot.ohlc[bot.ohlc['timestamp'] >= bot.current_trade_entry_time]
-                # if len(recent) > 0:
                     max_p = recent['high'].max()
                     min_p = recent['low'].min()
                     entry = bot.current_underlying_at_entry
@@ -93,7 +100,7 @@ class ExitEngine:
         asyncio.run(self.client.modify_sl_to_buycost(leg))
 
     def update_trailing_sl(self, leg):
-        """Apply ATR-based trailing SL logic."""
+        """Apply ATR-based trailing SL logic with dynamic buffer based on profit."""
         if not leg or leg.get("status") == "CLOSED":
             return None
 
@@ -101,10 +108,8 @@ class ExitEngine:
         if curr is None:
             return None
 
-        opt_atr = leg.get("atr")  # caller expected to update this
-        buffer_amt = self.trail_min_buffer
-        if opt_atr:
-            buffer_amt = max(self.trail_min_buffer, opt_atr * self.trail_factor)
+        # Get dynamic buffer based on profit level
+        buffer_amt = self._calculate_dynamic_buffer(leg)
 
         candidate = curr + buffer_amt
         prev = leg.get("stop_price")
@@ -113,6 +118,45 @@ class ExitEngine:
             leg["stop_price"] = candidate
             asyncio.run(self.client.modify_sl_to_cost(leg, leg["stop_price"]))
         return None
+
+    def _calculate_dynamic_buffer(self, leg):
+        """
+        Calculate trailing buffer dynamically based on profit level.
+        Returns wider buffers for early profits (let winners run),
+        tighter buffers for large profits (protect gains).
+        """
+        sell_price = leg.get("sell_price")
+        curr_price = leg.get("current_price")
+        
+        if not sell_price or not curr_price:
+            # Fallback to static buffer
+            opt_atr = leg.get("atr", 2.0)
+            return max(self.trail_min_buffer, opt_atr * self.trail_factor)
+        
+        # Calculate profit percentage
+        profit_pct = ((sell_price - curr_price) / sell_price) * 100.0
+        
+        # Use dynamic trailing if enabled
+        if self.use_dynamic_trailing:
+            # Find appropriate level based on profit percentage
+            trail_factor = self.trail_factor
+            min_buffer = self.trail_min_buffer
+            
+            for min_profit, factor, min_buf in sorted(self.dynamic_trail_levels, reverse=True):
+                if profit_pct >= min_profit:
+                    trail_factor = factor
+                    min_buffer = min_buf
+                    break
+            
+            # Calculate buffer with dynamic factor
+            opt_atr = leg.get("atr", 2.0)
+            buffer_amt = max(min_buffer, opt_atr * trail_factor)
+            
+            return buffer_amt
+        else:
+            # Static trailing (original logic)
+            opt_atr = leg.get("atr", 2.0)
+            return max(self.trail_min_buffer, opt_atr * self.trail_factor)
 
     def profit_target_hit(self, bot):
         pnl = bot.compute_total_pnl()
@@ -180,7 +224,7 @@ class ExitEngine:
         - If net loss > threshold -> Exit survivor too
         - Else -> Keep survivor and trail aggressively
         """
-        survivor = bot.ce if hit_leg is bot.pe else bot.pe
+        survivor = bot.ce if hit_leg == bot.pe else bot.pe
         
         if not survivor or survivor.get('status') == 'CLOSED':
             return "EXIT_ALL", "No survivor"

@@ -21,9 +21,9 @@ class Config:
     # ---- Environment ----
     PLACE_ORDERS: bool = False  # enable only when going live
 
-    OPENALGO_API_KEY: str = os.environ.get('OPENALGO_API_KEY', '17372815806d4e0223d9188589d69ac448db8d782d7742f650ee5d273c700cc6')
-    OPENALGO_HOST: str = os.environ.get('OPENALGO_HOST', 'http://34.180.48.62/')
-    OPENALGO_WS: str = os.environ.get('OPENALGO_WS', 'ws://34.180.48.62/ws')
+    OPENALGO_API_KEY: str = os.environ.get('OPENALGO_API_KEY', '')   
+    OPENALGO_HOST: str = os.environ.get('OPENALGO_HOST', 'http://34.14.208.231/')
+    OPENALGO_WS: str = os.environ.get('OPENALGO_WS', 'ws://34.14.208.231/ws')
 
     # ---- Trading Windows (IST) ----
     # CRUDEOILM major volatility cycles
@@ -64,6 +64,8 @@ class Config:
 
     # ---- RSI Divergence ----
     RSI_DIV_LOOKBACK: int = 10
+    RSI_PERIOD: int = 14  # RSI calculation period for mean reversion
+
 
     # ---- Directional Strategy ----
     EMA_FAST: int = 9
@@ -91,7 +93,7 @@ class Config:
     ACCOUNT_CAPITAL: float = 1000000.0   # 10L
     MARGIN_PER_LEG: float = 30000.0      # approx
     LEGS_PER_STRADDLE: int = 2
-    MAX_ALLOC_PER_TRADE_PCT: float = 0.2
+    MAX_ALLOC_PER_TRADE_PCT: float = 0.1
     MAX_TOTAL_ALLOC_PCT: float = 0.8
 
     # Lots = K / ATR (dynamic sizing)
@@ -117,8 +119,19 @@ class Config:
     ATR_MULTIPLIER_LOW: float = 0.8   # ATR extremely low
 
     TARGET_PCT_OF_CREDIT: float = 0.50
-    TRAIL_FACTOR: float = 1.20
-    TRAIL_MIN_BUFFER: float = 0.50
+    TRAIL_FACTOR: float = 2.5
+    TRAIL_MIN_BUFFER: float = 1.50
+    
+    # ---- Dynamic Trailing Based on Profit Level ----
+    USE_DYNAMIC_TRAILING: bool = True  # Enable profit-based dynamic trailing
+    # Profit thresholds and corresponding trail factors
+    # Format: (min_profit_pct, trail_factor, min_buffer)
+    DYNAMIC_TRAIL_LEVELS: List[Tuple[float, float, float]] = field(default_factory=lambda: [
+        (0,   3.0, 2.0),   # 0-10% profit: Wide buffer (let it run)
+        (10,  2.5, 1.5),   # 10-25% profit: Medium buffer
+        (25,  2.0, 1.2),   # 25-40% profit: Tighter buffer
+        (40,  1.5, 0.75),  # >40% profit: Tightest buffer (protect gains)
+    ])
 
     # ---- Early Exit: no movement / no decay ----
     NO_MOVE_WAIT_MINUTES: int = 15

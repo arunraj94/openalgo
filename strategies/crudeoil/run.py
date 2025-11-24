@@ -72,7 +72,9 @@ class UnifiedRun:
             no_move_wait_minutes=self.cfg.NO_MOVE_WAIT_MINUTES,
             min_decay_pct=self.cfg.MIN_DECAY_PCT,
             move_threshold_mult=self.cfg.MOVE_THRESHOLD_MULT,
-            client=self.client
+            client=self.client,
+            use_dynamic_trailing=self.cfg.USE_DYNAMIC_TRAILING,
+            dynamic_trail_levels=self.cfg.DYNAMIC_TRAIL_LEVELS
         )
 
         # OHLC
@@ -132,6 +134,7 @@ class UnifiedRun:
         return order_info
 
     def _record_exit(self, reason=""):
+        print("EXIT")
         if not self.current_trade_id:
             return
         try:
@@ -288,8 +291,12 @@ class UnifiedRun:
 
             # 3. Place Orders (Async)
             # Use NRML (Normal) product type via updated client
-            ce_order = await self.client.async_place_orders(ce_symbol, 'SELL', quantity, strategy_tag="STRADDLE")
-            pe_order = await self.client.async_place_orders(pe_symbol, 'SELL', quantity, strategy_tag="STRADDLE")
+            #ce_order = await self.client.async_place_orders(ce_symbol, 'SELL', quantity, strategy_tag="STRADDLE")
+            #pe_order = await self.client.async_place_orders(pe_symbol, 'SELL', quantity, strategy_tag="STRADDLE")
+            ce_order, pe_order = await asyncio.gather(
+                self.client.async_place_orders(ce_symbol, 'SELL', quantity, strategy_tag="STRADDLE"),
+                self.client.async_place_orders(pe_symbol, 'SELL', quantity, strategy_tag="STRADDLE")
+            )
 
             # 4. Check Order Status
             # if not ce_order or ce_order.get('order_status') != 'complete':
@@ -312,9 +319,38 @@ class UnifiedRun:
             ce_price = 0
             pe_price = 0
             
-            if ce_order and ce_order.get('order_status') == 'complete':
+            print(ce_order)
+            print(pe_order)
+            # Check if both orders completed successfully
+            ce_complete = ce_order and ce_order.get('order_status') == 'complete'
+            pe_complete = pe_order and pe_order.get('order_status') == 'complete'
+
+            if not ce_complete:
+                logger.warning(f"CE order not complete, skipping SL: {ce_order}")
+            if not pe_complete:
+                logger.warning(f"PE order not complete, skipping SL: {pe_order}")
+
+            # Extract prices for completed orders
+            if ce_complete:
                 ce_price = float(ce_order.get('average_price', ce_order.get('price', 0.0)))
+            if pe_complete:
+                pe_price = float(pe_order.get('average_price', pe_order.get('price', 0.0)))
+
+            # Place SL orders in parallel for both completed orders
+            if ce_complete and pe_complete:
+                # Both orders completed - place SL orders in parallel
+                ce_sl_order, pe_sl_order = await asyncio.gather(
+                    self.client.async_sl_order(ce_order, sl_pct, strategy_tag="STRADDLE"),
+                    self.client.async_sl_order(pe_order, sl_pct, strategy_tag="STRADDLE")
+                )
+            elif ce_complete:
+                # Only CE completed
                 ce_sl_order = await self.client.async_sl_order(ce_order, sl_pct, strategy_tag="STRADDLE")
+            elif pe_complete:
+                # Only PE completed
+                pe_sl_order = await self.client.async_sl_order(pe_order, sl_pct, strategy_tag="STRADDLE")
+             # Initialize leg tracking dictionaries for completed orders
+            if ce_complete and ce_sl_order:
                 self.ce = {
                     'symbol': ce_symbol,
                     'status': 'OPEN',
@@ -323,12 +359,8 @@ class UnifiedRun:
                     'qty': quantity,
                     'sl_order': ce_sl_order
                 }
-            else:
-                logger.warning(f"CE order not complete, skipping SL: {ce_order}")
-                
-            if pe_order and pe_order.get('order_status') == 'complete':
-                pe_price = float(pe_order.get('average_price', pe_order.get('price', 0.0)))
-                pe_sl_order = await self.client.async_sl_order(pe_order, sl_pct, strategy_tag="STRADDLE")
+            
+            if pe_complete and pe_sl_order:
                 self.pe = {
                     'symbol': pe_symbol,
                     'status': 'OPEN',
@@ -337,8 +369,6 @@ class UnifiedRun:
                     'qty': quantity,
                     'sl_order': pe_sl_order
                 }
-            else:
-                logger.warning(f"PE order not complete, skipping SL: {pe_order}")
 
             # 7. Mark position as active and initialize tracking
             credit = ce_price + pe_price
@@ -394,17 +424,20 @@ class UnifiedRun:
             return
 
         dt = datetime.fromtimestamp(ts_ms/1000.0, pytz.utc).astimezone(IST)
+        
+        # CHANGED: Use 5-minute candles instead of 1-minute for cleaner signals
         minute = dt.replace(second=0, microsecond=0)
+        candle_5min = minute.replace(minute=(minute.minute // 5) * 5)
 
         with self.lock:
             # New candle
             if self.curr_min is None:
-                self.curr_min = minute
+                self.curr_min = candle_5min
                 self.open = self.high = self.low = self.close = ltp
                 return
 
-            if minute != self.curr_min:
-                # finalize previous minute
+            if candle_5min != self.curr_min:
+                # finalize previous 5-minute candle
                 row = {
                     'timestamp': self.curr_min,
                     'open': self.open,
@@ -412,39 +445,37 @@ class UnifiedRun:
                     'low': self.low,
                     'close': self.close
                 }
-                logger.info(f"Candle: {row}")
+                logger.info(f"[5-MIN] Candle: O={self.open:.1f} H={self.high:.1f} L={self.low:.1f} C={self.close:.1f}")
 
                 self.ohlc.append(row)
                 self.update_ohlc_df()
 
-                # ATR calc
+                # ATR calc on 5-min data
                 self.compute_atrs()
 
-                # feed OHLC to detectors
+                # feed 5-min OHLC to detectors (compression, ORB, vol expansion, mean reversion)
                 self.detectors.update_ohlc(self.ohlc_df)
 
-                # ENTRY LOGIC
+                # ENTRY LOGIC - Now using 5-min data for better signals
                 if self.in_allowed_window() and not self.active_straddle:
                     sig = self.detectors.evaluate_priority_signals()
-                    # sig = self.entry.evaluate_()priority_signals()
-                    logger.info(f"Signal: {sig}")
+                    logger.info(f"[5-MIN] Signal: {sig}")
                     if sig:
                         lots = compute_lots_from_config(self.atr_short, self.cfg)
                         logger.info(f"Lots: {lots}")
-                        # lots = 1  # REMOVED hardcoded override
                         if lots > 0:
                             self.place_straddle(lots, entry_signal=sig)
 
-                # EXIT LOGIC
-                self.check_intraday_squareoff()
-                self.check_and_book_survivor()
+                if self.active_straddle:
+                    self.check_intraday_squareoff()
+                    self.check_and_book_survivor()
 
-                # reset for next minute
-                self.curr_min = minute
+                # reset for next 5-minute candle
+                self.curr_min = candle_5min
                 self.open = self.high = self.low = self.close = ltp
 
             else:
-                # update running candle
+                # update running 5-min candle
                 self.close = ltp
                 self.high = max(self.high, ltp)
                 self.low = min(self.low, ltp)
@@ -594,16 +625,16 @@ class UnifiedRun:
         if self.ce and self.ce.get('status') == 'OPEN':
             info = self.client.get_order_info_of_order(self.ce['sl_order']['orderid'])
             # print(info)
-            if info and info.get('order_status','').lower() != 'open':
-                self.ce['buy_price'] = info.get('price')
+            if info and info.get('order_status','').lower() != 'trigger pending':
+                self.ce['buy_price'] = float(info.get('price'))
                 self.handle_leg_sl_hit(self.ce)
                 return
 
         if self.pe and self.pe.get('status') == 'OPEN':
             info = self.client.get_order_info_of_order(self.pe['sl_order']['orderid'])
             # logger.debug(f"PE Order Info: {info}")
-            if info and info.get('order_status','').lower() != 'open':
-                self.pe['buy_price'] = info.get('price')
+            if info and info.get('order_status','').lower() != 'trigger pending':
+                self.pe['buy_price'] = float(info.get('price'))
                 self.handle_leg_sl_hit(self.pe)
                 return
 
@@ -624,7 +655,12 @@ class UnifiedRun:
 
         subs_sym = self.client.get_option_symbols(self.cfg.UNDERLYING_SYMBOL, self.cfg.UNDERLYING_EXCHANGE)
 
-        self.client.subscribe_ltp(subs_sym)
+        if subs_sym:  # Check for None
+            self.client.subscribe_ltp(subs_sym)
+        else:
+            logger.error("Failed to get option symbols. Cannot subscribe")
+            return
+        logger.info("Unified Short Straddle Bot listening to options...")
         self.client.subscribe_depth(subs_sym)
         self.client.subscribe_orderbook()
 
