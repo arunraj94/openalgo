@@ -18,9 +18,9 @@ class SensexCreditSpreadConfig:
     
     # ---- Environment ----
     PLACE_ORDERS: bool = False  # Set to True for live trading
-    OPENALGO_API_KEY: str = os.environ.get('OPENALGO_API_KEY', '487218d8093857f95d8ac73b833b8d1dcd97e83ba36fb3dc70ef5091eacce2b8')
-    OPENALGO_HOST: str = os.environ.get('OPENALGO_HOST', 'http://35.200.139.131/')
-    OPENALGO_WS: str = os.environ.get('OPENALGO_WS', 'ws://35.200.139.131/ws')
+    OPENALGO_API_KEY: str = os.environ.get('OPENALGO_API_KEY', '')
+    OPENALGO_HOST: str = os.environ.get('OPENALGO_HOST', '')
+    OPENALGO_WS: str = os.environ.get('OPENALGO_WS', '')
     
     # ---- Strategy ----
     STRATEGY_NAME: str = "SENSEX_DIRECTIONAL_CREDIT_SPREAD"
