@@ -14,6 +14,8 @@ import traceback
 import sqlite3
 import threading
 import pytz
+import logging
+from logging.handlers import RotatingFileHandler
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -22,6 +24,43 @@ from config import config
 from openalgo_client import OpenAlgoClientWrapper
 
 IST = pytz.timezone("Asia/Kolkata")
+
+# ================================================================================
+# LOGGING SETUP
+# ================================================================================
+
+def setup_logger():
+    """Configure file and console logging"""
+    logger = logging.getLogger('CreditSpread')
+    logger.setLevel(logging.DEBUG)
+    
+    # Remove existing handlers
+    logger.handlers.clear()
+    
+    # File handler with rotation (10MB max, keep 5 backups)
+    file_handler = RotatingFileHandler(
+        config.LOG_FILE,
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter(
+        '%(asctime)s | %(levelname)-8s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+    
+    # Console handler (only warnings/errors)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_formatter = logging.Formatter('%(levelname)s: %(message)s')
+    console_handler.setFormatter(console_formatter)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+logger = setup_logger()
 
 # ================================================================================
 # INDICATOR CALCULATIONS
@@ -732,7 +771,7 @@ class SensexCreditSpreadRunner:
         try:
             quote = self.client.client.quotes(
                 symbol=self.config.UNDERLYING_SYMBOL,
-                exchange="BSE"  # BSE for Sensex spot
+                exchange="BSE_INDEX"  # BSE for Sensex spot
             )
             print(f"[DEBUG] Spot Quote: {quote}")
             
@@ -796,7 +835,7 @@ class SensexCreditSpreadRunner:
             subscription_symbols.append(pe_sym)
         
         # Add spot symbol
-        subscription_symbols.append(self.spot_symbol)
+        subscription_symbols.append({'exchange': 'BSE_INDEX' , 'symbol': 'SENSEX'})
         
         print(f"[INIT] Total subscription symbols: {len(subscription_symbols)}")
         print(f"[INIT] CE strikes: {len(self.ce_symbols)}, PE strikes: {len(self.pe_symbols)}")

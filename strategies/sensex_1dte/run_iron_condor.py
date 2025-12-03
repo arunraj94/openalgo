@@ -15,6 +15,8 @@ import traceback
 import sqlite3
 import threading
 import pytz
+import logging
+from logging.handlers import RotatingFileHandler
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,6 +25,43 @@ from config_iron_condor import config
 from openalgo_client import OpenAlgoClientWrapper
 
 IST = pytz.timezone("Asia/Kolkata")
+
+# ================================================================================
+# LOGGING SETUP
+# ================================================================================
+
+def setup_logger():
+    """Configure file and console logging"""
+    logger = logging.getLogger('IronCondor')
+    logger.setLevel(logging.DEBUG)
+    
+    # Remove existing handlers
+    logger.handlers.clear()
+    
+    # File handler with rotation (10MB max, keep 5 backups)
+    file_handler = RotatingFileHandler(
+        config.LOG_FILE,
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter(
+        '%(asctime)s | %(levelname)-8s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+    
+    # Console handler (only critical messages)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)  # Only warnings and errors to console
+    console_formatter = logging.Formatter('%(levelname)s: %(message)s')
+    console_handler.setFormatter(console_formatter)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+logger = setup_logger()
 
 # ================================================================================
 # INDICATOR CALCULATIONS
@@ -73,14 +112,14 @@ def fetch_previous_day_ohlc(yahoo_symbol="^BSESN"):
         df = yf.download(yahoo_symbol, period="2d", interval="1d", progress=False)
         
         if len(df) < 2:
-            print("[ERROR] Not enough data from Yahoo Finance")
+            logger.error("Not enough data from Yahoo Finance")
             return None
         
         prev_high = float(df.iloc[-2]["High"])
         prev_low = float(df.iloc[-2]["Low"])
         prev_close = float(df.iloc[-2]["Close"])
         
-        print(f"[YAHOO] Previous Day - H: {prev_high}, L: {prev_low}, C: {prev_close}")
+        logger.info(f"[YAHOO] Previous Day - H: {prev_high}, L: {prev_low}, C: {prev_close}")
         
         return {
             'high': prev_high,
@@ -88,7 +127,7 @@ def fetch_previous_day_ohlc(yahoo_symbol="^BSESN"):
             'close': prev_close
         }
     except Exception as e:
-        print(f"[ERROR] Failed to fetch Yahoo data: {e}")
+        logger.error(f"Failed to fetch Yahoo data: {e}")
         traceback.print_exc()
         return None
 
@@ -196,7 +235,7 @@ def check_iron_condor_entry(df, spot_price, prev_day_close):
         return False, "Waiting for ATR data (need 3+ candles)"
     
     # 3. All conditions met - early morning + small gap + low ATR = rangebound
-    print(f"[IC SIGNAL] ✅ Conditions met - ATR: {atr_current:.2f}, Gap: {opening_gap:.0f}")
+    logger.info(f"[IC SIGNAL] ✅ Conditions met - ATR: {atr_current:.2f}, Gap: {opening_gap:.0f}")
     return True, "All conditions met"
 
 # ================================================================================
@@ -217,13 +256,13 @@ def select_iron_condor_strikes(spot_price, atr_value=None):
         sell_distance = round(sell_distance / config.STRIKE_STEP) * config.STRIKE_STEP
         buy_distance = round(buy_distance / config.STRIKE_STEP) * config.STRIKE_STEP
         
-        print(f"[IC] ATR-based strikes - ATR: {atr_value:.0f}, Sell: ±{sell_distance}, Buy: ±{buy_distance}")
+        logger.info(f"[IC] ATR-based strikes - ATR: {atr_value:.0f}, Sell: ±{sell_distance}, Buy: ±{buy_distance}")
     else:
         # Fixed distance
         sell_distance = config.SELL_CE_DISTANCE
         buy_distance = config.BUY_CE_DISTANCE
         
-        print(f"[IC] Fixed strikes - Sell: ±{sell_distance}, Buy: ±{buy_distance}")
+        logger.info(f"[IC] Fixed strikes - Sell: ±{sell_distance}, Buy: ±{buy_distance}")
     
     # Calculate strikes
     sell_ce = round((spot_price + sell_distance) / config.STRIKE_STEP) * config.STRIKE_STEP
@@ -231,8 +270,8 @@ def select_iron_condor_strikes(spot_price, atr_value=None):
     sell_pe = round((spot_price - sell_distance) / config.STRIKE_STEP) * config.STRIKE_STEP
     buy_pe = round((spot_price - buy_distance) / config.STRIKE_STEP) * config.STRIKE_STEP
     
-    print(f"[IC] Strikes - Sell {sell_ce} CE, Buy {buy_ce} CE, Sell {sell_pe} PE, Buy {buy_pe} PE")
-    print(f"[IC] Breakevens - Upper: ~{sell_ce + 25}, Lower: ~{sell_pe - 25}")
+    logger.info(f"[IC] Strikes - Sell {sell_ce} CE, Buy {buy_ce} CE, Sell {sell_pe} PE, Buy {buy_pe} PE")
+    logger.info(f"[IC] Breakevens - Upper: ~{sell_ce + 25}, Lower: ~{sell_pe - 25}")
     
     return int(sell_ce), int(buy_ce), int(sell_pe), int(buy_pe)
 
@@ -254,13 +293,13 @@ async def place_iron_condor(client, sell_ce, buy_ce, sell_pe, buy_pe, lots, expi
         sell_pe_symbol = f"{config.UNDERLYING_SYMBOL}{expiry}{sell_pe}PE"
         buy_pe_symbol = f"{config.UNDERLYING_SYMBOL}{expiry}{buy_pe}PE"
         
-        print(f"[IC] Placing Iron Condor:")
-        print(f"  CE Spread: Sell {sell_ce_symbol}, Buy {buy_ce_symbol}")
-        print(f"  PE Spread: Sell {sell_pe_symbol}, Buy {buy_pe_symbol}")
-        print(f"  Quantity: {quantity} per leg")
+        logger.info(f"[IC] Placing Iron Condor:")
+        logger.info(f"  CE Spread: Sell {sell_ce_symbol}, Buy {buy_ce_symbol}")
+        logger.info(f"  PE Spread: Sell {sell_pe_symbol}, Buy {buy_pe_symbol}")
+        logger.info(f"  Quantity: {quantity} per leg")
         
         if not config.PLACE_ORDERS:
-            print("[SIM] Simulated order placement")
+            logger.info("[SIM] Simulated order placement")
             return {
                 'type': 'IC',
                 'sell_ce': sell_ce,
@@ -295,7 +334,7 @@ async def place_iron_condor(client, sell_ce, buy_ce, sell_pe, buy_pe, lots, expi
         ])
         
         if not all_complete:
-            print(f"[IC] ❌ Order execution failed - Not all legs filled")
+            logger.error(f"Order execution failed - Not all legs filled")
             return None
         
         # Calculate total credit
@@ -315,9 +354,9 @@ async def place_iron_condor(client, sell_ce, buy_ce, sell_pe, buy_pe, lots, expi
         sl_pe_order = await client.async_sl_order(sell_pe_order, sl_pct, strategy_tag=config.STRATEGY_NAME)
         
         if not sl_ce_order:
-            print(f"[IC] ⚠️ SL order placement failed for {sell_ce_symbol}")
+            logger.warning(f"SL order placement failed for {sell_ce_symbol}")
         if not sl_pe_order:
-            print(f"[IC] ⚠️ SL order placement failed for {sell_pe_symbol}")
+            logger.warning(f"SL order placement failed for {sell_pe_symbol}")
         
         position = {
             'type': 'IC',
@@ -348,14 +387,14 @@ async def place_iron_condor(client, sell_ce, buy_ce, sell_pe, buy_pe, lots, expi
             'status': 'ACTIVE'
         }
         
-        print(f"[IC] ✅ Iron Condor placed")
-        print(f"  CE Credit: ₹{ce_credit:.2f}, PE Credit: ₹{pe_credit:.2f}")
-        print(f"  Total Credit: ₹{total_credit:.2f}")
+        logger.info(f"[IC] ✅ Iron Condor placed")
+        logger.info(f"  CE Credit: ₹{ce_credit:.2f}, PE Credit: ₹{pe_credit:.2f}")
+        logger.info(f"  Total Credit: ₹{total_credit:.2f}")
         
         return position
         
     except Exception as e:
-        print(f"[ERROR] Failed to place Iron Condor: {e}")
+        logger.error(f"Failed to place Iron Condor: {e}")
         traceback.print_exc()
     
     return None
@@ -537,7 +576,7 @@ class SensexIronCondorRunner:
         try:
             quote = self.client.client.quotes(
                 symbol=self.config.UNDERLYING_SYMBOL,
-                exchange="BSE"
+                exchange="BSE_INDEX"
             )
             print(f"[DEBUG] Spot Quote: {quote}")
             
@@ -569,7 +608,7 @@ class SensexIronCondorRunner:
         # Build strike range (±30 from ATM)
         strike_range = [
             self.current_atm + (i * self.client.strike_step) 
-            for i in range(-30, 31)
+            for i in range(-10, 11)
         ]
         
         # Build CE and PE symbols
@@ -596,7 +635,7 @@ class SensexIronCondorRunner:
             self.pe_symbols[strike] = pe_sym
             subscription_symbols.append(pe_sym)
         
-        subscription_symbols.append(self.spot_symbol)
+        subscription_symbols.append({'exchange': 'BSE_INDEX', 'symbol': self.config.UNDERLYING_SYMBOL})
         
         print(f"[INIT] Total subscription symbols: {len(subscription_symbols)}")
         print(f"[INIT] CE strikes: {len(self.ce_symbols)}, PE strikes: {len(self.pe_symbols)}")
@@ -640,7 +679,7 @@ class SensexIronCondorRunner:
         
         if ltp is None or ts_ms is None:
             return
-        
+        # print(tick)
         dt = datetime.fromtimestamp(ts_ms/1000.0, pytz.utc).astimezone(IST)
         
         # Build 5-minute candles
@@ -697,7 +736,6 @@ class SensexIronCondorRunner:
         """Main LTP callback for all subscribed symbols"""
         if data.get('type') != 'market_data':
             return
-        
         symbol = data.get('symbol')
         exch = data.get('exchange')
         tick = data.get('data', {})
@@ -732,7 +770,7 @@ class SensexIronCondorRunner:
             )
             
             if not can_enter:
-                print(f"[INFO] Entry conditions not met: {reason}")
+                logger.debug(f"Entry conditions not met: {reason}")
                 return
             
             print(f"[ENTRY] 🎯 Tranche 1 entry signal - Initial IC setup")
@@ -890,206 +928,6 @@ class SensexIronCondorRunner:
                 traceback.print_exc()
             finally:
                 loop.close()
-    
-    def on_option_tick(self, symbol, ltp):
-        """Handle option tick - update LTP cache"""
-        self.ltp_cache[symbol] = ltp
-    
-    def on_ltp(self, data):
-        """Main LTP callback for all subscribed symbols"""
-        if data.get('type') != 'market_data':
-            return
-        
-        symbol = data.get('symbol')
-        exch = data.get('exchange')
-        tick = data.get('data', {})
-        ltp = tick.get('ltp')
-        
-        if ltp is None:
-            return
-        
-        # Spot/underlying tick
-        if symbol == self.config.UNDERLYING_SYMBOL:
-            self.on_underlying_tick(tick)
-        # Options tick
-        elif exch == self.config.UNDERLYING_EXCHANGE:
-            self.on_option_tick(symbol, ltp)
-    
-    def check_entry_signal(self):
-        """Check for Iron Condor entry signal (first tranche or scaling)"""
-        if not self.state.can_enter(self.now_ist()):
-            return
-        
-        if self.state.df is None or len(self.state.df) == 0:
-            return
-        
-        current_spot = self.close
-        
-        # FIRST TRANCHE: Entry conditions (9:25-9:35 AM)
-        if self.state.entry_count == 0:
-            can_enter, reason = check_iron_condor_entry(
-                self.state.df,
-                current_spot,
-                self.state.prev_day_data['close']
-            )
-            
-            if not can_enter:
-                print(f"[INFO] Entry conditions not met: {reason}")
-                return
-            
-            print(f"[ENTRY] 🎯 Tranche 1 entry signal - Initial IC setup")
-        
-        # SUBSEQUENT TRANCHES: Premium expansion trigger
-        else:
-            # Check if total IC premium has increased by 10%
-            current_total_premium = self.get_total_ic_premium()
-            
-            if current_total_premium <= 0 or self.state.initial_premium is None:
-                return  # Wait for valid premium data
-            
-            premium_increase_pct = ((current_total_premium - self.state.initial_premium) / 
-                                   self.state.initial_premium) * 100
-            
-            if premium_increase_pct < config.TRANCHE_PREMIUM_INCREASE_PCT:
-                return  # Not enough premium expansion yet
-            
-            print(f"[ENTRY] 📈 Tranche {self.state.entry_count + 1} trigger - Premium increase: {premium_increase_pct:.1f}%")
-            
-            # Update baseline for next tranche
-            self.state.initial_premium = current_total_premium
-        
-        # Get lot size for this tranche
-        lots = self.state.get_entry_lots()
-        
-        # Get ATR for strike selection
-        atr_value = self.state.df.iloc[-1]['atr']
-        
-        # Select strikes
-        sell_ce, buy_ce, sell_pe, buy_pe = select_iron_condor_strikes(current_spot, atr_value)
-        
-        # Place order in separate thread
-        threading.Thread(
-            target=self._run_async_order,
-            args=(sell_ce, buy_ce, sell_pe, buy_pe, lots)
-        ).start()
-    
-    def get_total_ic_premium(self):
-        """Calculate total current premium of all active IC positions"""
-        total = 0
-        
-        for position in self.state.positions:
-            if position['status'] != 'ACTIVE':
-                continue
-            
-            # Get LTPs for all 4 legs
-            ltp_sell_ce = self.ltp_cache.get(position['sell_ce_symbol'], 0)
-            ltp_buy_ce = self.ltp_cache.get(position['buy_ce_symbol'], 0)
-            ltp_sell_pe = self.ltp_cache.get(position['sell_pe_symbol'], 0)
-            ltp_buy_pe = self.ltp_cache.get(position['buy_pe_symbol'], 0)
-            
-            if any([ltp_sell_ce <= 0, ltp_buy_ce <= 0, ltp_sell_pe <= 0, ltp_buy_pe <= 0]):
-                continue  # Skip if LTPs not available
-            
-            # Current spread value (what we'd pay to close)
-            ce_spread = ltp_sell_ce - ltp_buy_ce
-            pe_spread = ltp_sell_pe - ltp_buy_pe
-            total += ce_spread + pe_spread
-        
-        return total
-    
-    def _run_async_order(self, sell_ce, buy_ce, sell_pe, buy_pe, lots):
-        """Helper to run async order placement"""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        try:
-            position = loop.run_until_complete(
-                place_iron_condor(
-                    self.client, sell_ce, buy_ce, sell_pe, buy_pe, lots, self.nearest_expiry
-                )
-            )
-            
-            if position:
-                with self.lock:
-                    self.state.add_position(position)
-                print(f"[POSITION] Added Iron Condor: CE {position['sell_ce']}/{position['buy_ce']}, PE {position['sell_pe']}/{position['buy_pe']}")
-        
-        except Exception as e:
-            print(f"[ERROR] Order placement failed: {e}")
-            traceback.print_exc()
-        finally:
-            loop.close()
-    
-    def check_exit_conditions_ic(self):
-        """Check exit conditions for Iron Condor"""
-        position = self.state.position
-        
-        if not position or position['status'] != 'ACTIVE':
-            return
-        
-        # Get current LTPs for all 4 legs
-        ltp_sell_ce = self.ltp_cache.get(position['sell_ce_symbol'], 0)
-        ltp_buy_ce = self.ltp_cache.get(position['buy_ce_symbol'], 0)
-        ltp_sell_pe = self.ltp_cache.get(position['sell_pe_symbol'], 0)
-        ltp_buy_pe = self.ltp_cache.get(position['buy_pe_symbol'], 0)
-        
-        if any([ltp_sell_ce == 0, ltp_buy_ce == 0, ltp_sell_pe == 0, ltp_buy_pe == 0]):
-            return
-        
-        # Check if SL orders were triggered
-        for sl_key in ['sl_ce_order', 'sl_pe_order']:
-            sl_order = position.get(sl_key)
-            if sl_order:
-                sl_order_id = sl_order.get('orderid')
-                if sl_order_id:
-                    sl_info = self.client.get_order_info_of_order(sl_order_id)
-                    if sl_info and sl_info.get('order_status', '').lower() != 'trigger pending':
-                        print(f"[SL HIT] Stop loss triggered - {sl_key}")
-                        
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        try:
-                            success = loop.run_until_complete(
-                                exit_iron_condor(self.client, position, "SL_ORDER_HIT")
-                            )
-                            if success:
-                                with self.lock:
-                                    self.state.clear_position()
-                                print(f"[EXIT] ✅ Iron Condor closed due to SL")
-                        except Exception as e:
-                            print(f"[ERROR] SL exit failed: {e}")
-                        finally:
-                            loop.close()
-                        return
-        
-        # Check spread-value based exits
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        try:
-            should_exit, reason = loop.run_until_complete(
-                check_exit_conditions(
-                    self.client, position, ltp_sell_ce, ltp_buy_ce, ltp_sell_pe, ltp_buy_pe
-                )
-            )
-            
-            if should_exit:
-                print(f"[EXIT] Exit triggered: {reason}")
-                
-                success = loop.run_until_complete(
-                    exit_iron_condor(self.client, position, reason)
-                )
-                
-                if success:
-                    with self.lock:
-                        self.state.clear_position()
-                    print(f"[EXIT] ✅ Iron Condor closed: {reason}")
-        
-        except Exception as e:
-            print(f"[ERROR] Exit check failed: {e}")
-            traceback.print_exc()
-        finally:
-            loop.close()
     
     def start(self):
         """Start the strategy runner"""
